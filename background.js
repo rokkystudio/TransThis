@@ -1,6 +1,25 @@
 const MESSAGE_TRANSLATE = "TRANS_THIS_TRANSLATE";
 const GOOGLE_TRANSLATE_URL = "https://translate.googleapis.com/translate_a/single";
+const DEFAULT_SOURCE_LANGUAGE = "auto";
 const DEFAULT_TARGET_LANGUAGE = "ru";
+
+const SUPPORTED_SOURCE_LANGUAGES = new Set([
+  "auto",
+  "ar",
+  "de",
+  "en",
+  "es",
+  "fr",
+  "it",
+  "ja",
+  "ko",
+  "pl",
+  "pt",
+  "ru",
+  "tr",
+  "uk",
+  "zh-CN"
+]);
 
 const SUPPORTED_TARGET_LANGUAGES = new Set([
   "ar",
@@ -20,16 +39,16 @@ const SUPPORTED_TARGET_LANGUAGES = new Set([
 ]);
 
 /**
- * Routes translation requests from the content script to the background context.
- * The background context owns the cross-origin request because it has host permissions
- * for translate.googleapis.com in manifest.json.
+ * Направляет запросы перевода из content script в background context.
+ * Background context выполняет cross-origin запрос, потому что в manifest.json
+ * ему выданы host permissions для translate.googleapis.com.
  */
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (!message || message.type !== MESSAGE_TRANSLATE) {
     return false;
   }
 
-  translateSelection(message.text, message.targetLanguage)
+  translateSelection(message.text, message.sourceLanguage, message.targetLanguage)
     .then((result) => {
       sendResponse({ ok: true, result });
     })
@@ -44,23 +63,25 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 });
 
 /**
- * Requests an automatic-source translation from Google Translate's public web endpoint.
- * The response includes a plain translation and dictionary groups when the endpoint
- * returns entries for the selected word.
+ * Запрашивает перевод у публичного web-endpoint Google Translate.
+ * Ответ включает основной перевод и словарные группы, когда endpoint
+ * возвращает словарные значения для выбранного слова.
  *
- * @param {string} text Selected text from the page.
- * @param {string} targetLanguage Target language code.
+ * @param {string} text Выделенный текст со страницы.
+ * @param {string} sourceLanguage Код языка исходного текста.
+ * @param {string} targetLanguage Код языка перевода.
  * @returns {Promise<{translation: string, sourceLanguage: string, dictionary: Array<{partOfSpeech: string, terms: string[], entries: Array<{word: string, reverseTranslations: string[]}>}>}>}
  */
-async function translateSelection(text, targetLanguage) {
+async function translateSelection(text, sourceLanguage, targetLanguage) {
   const normalizedText = normalizeSelectedText(text);
 
   if (!normalizedText) {
     throw new Error("Выделите слово или предложение для перевода.");
   }
 
+  const safeSourceLanguage = normalizeSourceLanguage(sourceLanguage);
   const safeTargetLanguage = normalizeTargetLanguage(targetLanguage);
-  const url = buildTranslateUrl(normalizedText, safeTargetLanguage);
+  const url = buildTranslateUrl(normalizedText, safeSourceLanguage, safeTargetLanguage);
   const response = await fetch(url.toString(), {
     method: "GET",
     cache: "no-store"
@@ -72,14 +93,14 @@ async function translateSelection(text, targetLanguage) {
 
   const payload = await response.json();
 
-  return parseTranslatePayload(payload);
+  return parseTranslatePayload(payload, safeSourceLanguage);
 }
 
 /**
- * Normalizes selected page text so the request contains visible content only.
+ * Нормализует выделенный текст так, чтобы запрос содержал только видимый контент.
  *
- * @param {string} text Selected text from the page.
- * @returns {string} Text with collapsed whitespace.
+ * @param {string} text Выделенный текст со страницы.
+ * @returns {string} Текст с нормализованными пробелами.
  */
 function normalizeSelectedText(text) {
   return String(text || "")
@@ -88,10 +109,26 @@ function normalizeSelectedText(text) {
 }
 
 /**
- * Returns a supported target language code or the default target language.
+ * Возвращает поддерживаемый код языка исходного текста или код языка по умолчанию.
  *
- * @param {string} language Target language code from the content script.
- * @returns {string} Supported target language code.
+ * @param {string} language Код языка исходного текста из content script.
+ * @returns {string} Поддерживаемый код языка исходного текста.
+ */
+function normalizeSourceLanguage(language) {
+  const normalizedLanguage = String(language || "").trim();
+
+  if (SUPPORTED_SOURCE_LANGUAGES.has(normalizedLanguage)) {
+    return normalizedLanguage;
+  }
+
+  return DEFAULT_SOURCE_LANGUAGE;
+}
+
+/**
+ * Возвращает поддерживаемый код языка перевода или код языка по умолчанию.
+ *
+ * @param {string} language Код языка перевода из content script.
+ * @returns {string} Поддерживаемый код языка перевода.
  */
 function normalizeTargetLanguage(language) {
   const normalizedLanguage = String(language || "").trim();
@@ -104,17 +141,19 @@ function normalizeTargetLanguage(language) {
 }
 
 /**
- * Builds the translate.googleapis.com request URL with source language detection.
+ * Собирает URL запроса к translate.googleapis.com с выбранным языком источника
+ * и языком перевода.
  *
- * @param {string} text Selected text from the page.
- * @param {string} targetLanguage Target language code.
- * @returns {URL} Request URL for the Google Translate web endpoint.
+ * @param {string} text Выделенный текст со страницы.
+ * @param {string} sourceLanguage Код языка исходного текста.
+ * @param {string} targetLanguage Код языка перевода.
+ * @returns {URL} URL запроса к web-endpoint Google Translate.
  */
-function buildTranslateUrl(text, targetLanguage) {
+function buildTranslateUrl(text, sourceLanguage, targetLanguage) {
   const url = new URL(GOOGLE_TRANSLATE_URL);
 
   url.searchParams.set("client", "gtx");
-  url.searchParams.set("sl", "auto");
+  url.searchParams.set("sl", sourceLanguage);
   url.searchParams.set("tl", targetLanguage);
   url.searchParams.set("hl", targetLanguage);
   url.searchParams.append("dt", "t");
@@ -127,12 +166,13 @@ function buildTranslateUrl(text, targetLanguage) {
 }
 
 /**
- * Converts the Google Translate endpoint response into the extension's UI model.
+ * Преобразует ответ translate.googleapis.com в UI-модель расширения.
  *
- * @param {unknown} payload Parsed JSON response from translate.googleapis.com.
- * @returns {{translation: string, sourceLanguage: string, dictionary: Array<{partOfSpeech: string, terms: string[], entries: Array<{word: string, reverseTranslations: string[]}>}>}} Translation model.
+ * @param {unknown} payload Разобранный JSON-ответ от translate.googleapis.com.
+ * @param {string} requestedSourceLanguage Код языка источника, переданный в запросе.
+ * @returns {{translation: string, sourceLanguage: string, dictionary: Array<{partOfSpeech: string, terms: string[], entries: Array<{word: string, reverseTranslations: string[]}>}>}} UI-модель перевода.
  */
-function parseTranslatePayload(payload) {
+function parseTranslatePayload(payload, requestedSourceLanguage) {
   if (!payload || typeof payload !== "object") {
     throw new Error("Google Translate вернул неожиданный ответ.");
   }
@@ -148,16 +188,16 @@ function parseTranslatePayload(payload) {
 
   return {
     translation,
-    sourceLanguage: response.src || "auto",
+    sourceLanguage: response.src || requestedSourceLanguage || DEFAULT_SOURCE_LANGUAGE,
     dictionary: parseDictionary(response.dict)
   };
 }
 
 /**
- * Converts dictionary groups returned by Google Translate into display-ready entries.
+ * Преобразует словарные группы из ответа Google Translate в готовые для UI записи.
  *
- * @param {unknown} dictionary Dictionary section from the Google Translate response.
- * @returns {Array<{partOfSpeech: string, terms: string[], entries: Array<{word: string, reverseTranslations: string[]}>}>} Dictionary groups.
+ * @param {unknown} dictionary Секция словаря из ответа Google Translate.
+ * @returns {Array<{partOfSpeech: string, terms: string[], entries: Array<{word: string, reverseTranslations: string[]}>}>} Словарные группы.
  */
 function parseDictionary(dictionary) {
   if (!Array.isArray(dictionary)) {
