@@ -1,4 +1,6 @@
 const MESSAGE_TRANSLATE = "TRANS_THIS_TRANSLATE";
+const CONTENT_SCRIPT_FILES = ["content.js"];
+const CONTENT_STYLE_FILES = ["content.css"];
 const GOOGLE_TRANSLATE_URL = "https://translate.googleapis.com/translate_a/single";
 const DEFAULT_SOURCE_LANGUAGE = "auto";
 const DEFAULT_TARGET_LANGUAGE = "ru";
@@ -38,6 +40,14 @@ const SUPPORTED_TARGET_LANGUAGES = new Set([
   "zh-CN"
 ]);
 
+chrome.runtime.onInstalled.addListener(() => {
+  reinjectContentScriptsIntoOpenTabs();
+});
+
+chrome.runtime.onStartup.addListener(() => {
+  reinjectContentScriptsIntoOpenTabs();
+});
+
 /**
  * Направляет запросы перевода из content script в background context.
  * Background context выполняет cross-origin запрос, потому что в manifest.json
@@ -63,6 +73,100 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 });
 
 /**
+ * Повторно внедряет content script и стили в уже открытые вкладки после
+ * перезагрузки, обновления расширения или запуска браузера.
+ */
+async function reinjectContentScriptsIntoOpenTabs() {
+  if (!chrome.tabs || !chrome.scripting) {
+    return;
+  }
+
+  let tabs = [];
+
+  try {
+    tabs = await chrome.tabs.query({});
+  } catch (error) {
+    return;
+  }
+
+  await Promise.allSettled(tabs.map((tab) => injectContentScriptsIntoTab(tab)));
+}
+
+/**
+ * Внедряет content script и CSS в указанную вкладку, пропуская страницы,
+ * недоступные для расширений.
+ *
+ * @param {{id?: number, url?: string}} tab Вкладка браузера.
+ */
+async function injectContentScriptsIntoTab(tab) {
+  if (!tab || typeof tab.id !== "number" || !canInjectIntoTabUrl(tab.url)) {
+    return;
+  }
+
+  try {
+    await chrome.scripting.insertCSS({
+      target: {
+        tabId: tab.id,
+        allFrames: true
+      },
+      files: CONTENT_STYLE_FILES
+    });
+  } catch (error) {
+    if (!isExpectedInjectionError(error)) {
+      console.warn("TransThis: failed to insert CSS into tab", tab.id, error);
+    }
+  }
+
+  try {
+    await chrome.scripting.executeScript({
+      target: {
+        tabId: tab.id,
+        allFrames: true
+      },
+      files: CONTENT_SCRIPT_FILES
+    });
+  } catch (error) {
+    if (!isExpectedInjectionError(error)) {
+      console.warn("TransThis: failed to inject content script into tab", tab.id, error);
+    }
+  }
+}
+
+/**
+ * Проверяет, можно ли внедрять content scripts в URL вкладки.
+ *
+ * @param {string|undefined} url URL вкладки.
+ * @returns {boolean} Признак доступности вкладки для внедрения.
+ */
+function canInjectIntoTabUrl(url) {
+  if (!url || typeof url !== "string") {
+    return false;
+  }
+
+  return /^(https?|file):/i.test(url);
+}
+
+/**
+ * Относит ошибки внедрения к ожидаемым случаям: служебные страницы браузера,
+ * магазин расширений, закрытая вкладка или другие недоступные контексты.
+ *
+ * @param {unknown} error Ошибка Chrome API.
+ * @returns {boolean} Признак ожидаемой ошибки внедрения.
+ */
+function isExpectedInjectionError(error) {
+  const message = error instanceof Error
+    ? error.message
+    : String(error || "");
+
+  return message.includes("Cannot access")
+    || message.includes("The extensions gallery cannot be scripted")
+    || message.includes("Missing host permission")
+    || message.includes("No tab with id")
+    || message.includes("Frame with ID")
+    || message.includes("Tab was closed");
+}
+
+/**
  * Запрашивает перевод у публичного web-endpoint Google Translate.
  * Ответ включает основной перевод и словарные группы, когда endpoint
  * возвращает словарные значения для выбранного слова.
@@ -82,10 +186,16 @@ async function translateSelection(text, sourceLanguage, targetLanguage) {
   const safeSourceLanguage = normalizeSourceLanguage(sourceLanguage);
   const safeTargetLanguage = normalizeTargetLanguage(targetLanguage);
   const url = buildTranslateUrl(normalizedText, safeSourceLanguage, safeTargetLanguage);
-  const response = await fetch(url.toString(), {
-    method: "GET",
-    cache: "no-store"
-  });
+  let response;
+
+  try {
+    response = await fetch(url.toString(), {
+      method: "GET",
+      cache: "no-store"
+    });
+  } catch (error) {
+    throw createTranslateNetworkError(error);
+  }
 
   if (!response.ok) {
     throw new Error(`Google Translate вернул HTTP ${response.status}.`);
@@ -94,6 +204,28 @@ async function translateSelection(text, sourceLanguage, targetLanguage) {
   const payload = await response.json();
 
   return parseTranslatePayload(payload, safeSourceLanguage);
+}
+
+/**
+ * Преобразует сетевую ошибку запроса перевода в понятное сообщение для UI.
+ *
+ * @param {unknown} error Ошибка fetch.
+ * @returns {Error} Нормализованная ошибка перевода.
+ */
+function createTranslateNetworkError(error) {
+  const message = error instanceof Error
+    ? error.message
+    : String(error || "");
+
+  if (message.includes("Failed to fetch") || error instanceof TypeError) {
+    return new Error(
+      "Не удалось подключиться к Google Translate. Проверьте доступ к translate.googleapis.com и настройки прокси в браузере."
+    );
+  }
+
+  return error instanceof Error
+    ? error
+    : new Error("Не удалось получить перевод.");
 }
 
 /**

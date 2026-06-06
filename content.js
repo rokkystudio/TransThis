@@ -1232,7 +1232,8 @@
 
     return message.includes("Extension context invalidated")
       || message.includes("context invalidated")
-      || message.includes("Extension context was invalidated");
+      || message.includes("Extension context was invalidated")
+      || message.includes("Could not establish connection. Receiving end does not exist.");
   }
 
   /**
